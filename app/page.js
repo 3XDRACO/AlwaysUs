@@ -35,10 +35,24 @@ export default function ChatPage() {
   const [attentionSent, setAttentionSent] = useState(false);
   const messagesEndRef = useRef(null);
 
-  // Initialize Tabs from Supabase / localStorage
+  // Initialize Tabs from Server Sync / Supabase / localStorage
   useEffect(() => {
     async function loadChatData() {
-      // 1. Try Supabase if configured
+      // 1. Try Server Sync API first (guarantees cross-device sync)
+      try {
+        const syncRes = await fetch('/api/sync');
+        const syncData = await syncRes.json();
+        if (syncData.success && Array.isArray(syncData.tabs) && syncData.tabs.length > 0) {
+          setTabs(syncData.tabs);
+          setActiveTabId(syncData.tabs[0].id);
+          localStorage.setItem('alwaysus_chat_tabs', JSON.stringify(syncData.tabs));
+          return;
+        }
+      } catch (e) {
+        console.warn('Server sync read fallback:', e);
+      }
+
+      // 2. Try Supabase directly if configured
       if (isSupabaseConfigured && supabase) {
         try {
           const { data: convs, error } = await supabase
@@ -46,7 +60,6 @@ export default function ChatPage() {
             .select('*')
             .order('created_at', { ascending: true });
           if (!error && convs && convs.length > 0) {
-            // Load messages for each conversation
             const loadedTabs = await Promise.all(
               convs.map(async (c) => {
                 const { data: msgs } = await supabase
@@ -91,7 +104,7 @@ export default function ChatPage() {
         }
       }
 
-      // 2. Fallback to localStorage
+      // 3. Fallback to localStorage
       const savedTabs = localStorage.getItem('alwaysus_chat_tabs');
       if (savedTabs) {
         try {
@@ -104,22 +117,36 @@ export default function ChatPage() {
         } catch (e) {}
       }
 
-      // 3. Default first tab
+      // 4. Default first tab
+      const firstTabId = 'tab_' + Date.now();
+      const firstWelcome = getRandomWelcome();
       const firstTab = {
-        id: 'tab_' + Date.now(),
+        id: firstTabId,
         title: 'Chat 1',
         createdAt: new Date().toISOString(),
         messages: [
           {
             id: 'welcome_' + Date.now(),
             sender_type: 'ai',
-            content: getRandomWelcome(),
+            content: firstWelcome,
             created_at: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           }
         ]
       };
       setTabs([firstTab]);
       setActiveTabId(firstTab.id);
+
+      // Save initial tab to sync server in background
+      fetch('/api/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'create_tab',
+          tabId: firstTabId,
+          title: 'Chat 1',
+          welcomeMsg: firstWelcome
+        })
+      }).catch(() => {});
     }
 
     loadChatData();
@@ -163,10 +190,22 @@ export default function ChatPage() {
     setTabs((prev) => [...prev, newTab]);
     setActiveTabId(newTab.id);
 
-    // Sync to Supabase in background
+    // Sync to backend /api/sync (shared across devices)
+    fetch('/api/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'create_tab',
+        tabId,
+        title,
+        welcomeMsg
+      })
+    }).catch(() => {});
+
+    // Sync to Supabase directly if configured
     if (isSupabaseConfigured && supabase) {
       try {
-        await supabase.from('conversations').insert({ id: tabId, title });
+        await supabase.from('conversations').upsert({ id: tabId, title });
         await supabase
           .from('messages')
           .insert({ conversation_id: tabId, sender_type: 'ai', content: welcomeMsg });
@@ -196,6 +235,19 @@ export default function ChatPage() {
     );
     setInputText('');
     setIsTyping(true);
+
+    // Sync user message to Server Sync immediately
+    fetch('/api/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'save_message',
+        tabId: activeTabId,
+        title: activeTab?.title || 'Chat',
+        message: text,
+        sender_type: 'partner'
+      })
+    }).catch(() => {});
 
     // Save user message to Supabase
     if (isSupabaseConfigured && supabase) {
@@ -233,6 +285,19 @@ export default function ChatPage() {
           t.id === activeTabId ? { ...t, messages: [...updatedMessages, aiMsg] } : t
         )
       );
+
+      // Sync AI message to Server Sync immediately
+      fetch('/api/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'save_message',
+          tabId: activeTabId,
+          title: activeTab?.title || 'Chat',
+          message: aiReply,
+          sender_type: 'ai'
+        })
+      }).catch(() => {});
 
       // Save AI message to Supabase
       if (isSupabaseConfigured && supabase) {
@@ -305,119 +370,118 @@ export default function ChatPage() {
     <AuthGuard>
       <div className="chat-page-wrapper">
         <div className="chat-container">
-        {/* Top Header */}
-        <div className="chat-top-bar">
-          <div className="chat-companion-info">
-            <div className="avatar-circle">S</div>
-            <div className="companion-details">
-              <h2>
-                Shakti{' '}
-                <span
-                  style={{
-                    fontSize: '0.72rem',
-                    color: 'var(--accent-primary)',
-                    fontWeight: 600,
-                    background: 'var(--bg-secondary)',
-                    padding: '0.15rem 0.55rem',
-                    borderRadius: '99px'
-                  }}
-                >
-                  Companion
-                </span>
-              </h2>
-              <div className="companion-status">Always here for you ❤️</div>
+          {/* Top Header */}
+          <div className="chat-top-bar">
+            <div className="chat-companion-info">
+              <div className="avatar-circle">S</div>
+              <div className="companion-details">
+                <h2>
+                  Shakti{' '}
+                  <span
+                    style={{
+                      fontSize: '0.72rem',
+                      color: 'var(--accent-primary)',
+                      fontWeight: 600,
+                      background: 'var(--bg-secondary)',
+                      padding: '0.15rem 0.55rem',
+                      borderRadius: '99px'
+                    }}
+                  >
+                    Companion
+                  </span>
+                </h2>
+                <div className="companion-status">Always here for you ❤️</div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <button
+                onClick={() => setShowAttentionModal(true)}
+                className="btn btn-sm"
+                style={{
+                  backgroundColor: '#FFF0F5',
+                  color: '#C0267D',
+                  border: '1px solid #FBCFE8',
+                  fontWeight: 600,
+                  boxShadow: '0 2px 6px rgba(192, 38, 125, 0.1)',
+                  whiteSpace: 'nowrap'
+                }}
+              >
+                🔔 Need Attention
+              </button>
             </div>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            {/* Note: Partner does NOT have delete/reset button, only Need Attention */}
+          {/* Multi-Tab Bar */}
+          <div className="chat-tabs-bar">
+            {tabs.map((tab) => (
+              <div
+                key={tab.id}
+                onClick={() => setActiveTabId(tab.id)}
+                className={`chat-tab ${tab.id === activeTabId ? 'active' : ''}`}
+              >
+                <span>💬</span>
+                <span>{tab.title}</span>
+              </div>
+            ))}
             <button
-              onClick={() => setShowAttentionModal(true)}
-              className="btn btn-sm"
-              style={{
-                backgroundColor: '#FFF0F5',
-                color: '#C0267D',
-                border: '1px solid #FBCFE8',
-                fontWeight: 600,
-                boxShadow: '0 2px 6px rgba(192, 38, 125, 0.1)'
-              }}
+              onClick={handleCreateNewTab}
+              className="chat-tab-new"
+              title="Open new chat tab"
             >
-              🔔 Need Attention
+              <span>+</span> New Tab
             </button>
           </div>
-        </div>
 
-        {/* Multi-Tab Bar */}
-        <div className="chat-tabs-bar">
-          {tabs.map((tab) => (
-            <div
-              key={tab.id}
-              onClick={() => setActiveTabId(tab.id)}
-              className={`chat-tab ${tab.id === activeTabId ? 'active' : ''}`}
-            >
-              <span>💬</span>
-              <span>{tab.title}</span>
-            </div>
-          ))}
-          <button
-            onClick={handleCreateNewTab}
-            className="chat-tab-new"
-            title="Open new chat tab"
-          >
-            <span>+</span> New Tab
-          </button>
-        </div>
-
-        {/* Messages Window */}
-        <div className="chat-messages">
-          {activeTab?.messages?.map((msg) => (
-            <div key={msg.id} className={`message-row ${msg.sender_type}`}>
-              <div className="message-bubble">{msg.content}</div>
-              {/* IMPORTANT: AI label displays as 'Shakti' without '(AI)' */}
-              <div className="message-meta">
-                {msg.sender_type === 'partner' ? 'You' : 'Shakti'} • {msg.created_at}
+          {/* Messages Window */}
+          <div className="chat-messages">
+            {activeTab?.messages?.map((msg) => (
+              <div key={msg.id} className={`message-row ${msg.sender_type}`}>
+                <div className="message-bubble">{msg.content}</div>
+                <div className="message-meta">
+                  {msg.sender_type === 'partner' ? 'You' : 'Shakti'} • {msg.created_at}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
 
-          {isTyping && (
-            <div className="message-row ai">
-              <div className="typing-bubble">
-                <span className="typing-dot"></span>
-                <span className="typing-dot"></span>
-                <span className="typing-dot"></span>
+            {isTyping && (
+              <div className="message-row ai">
+                <div className="typing-bubble">
+                  <span className="typing-dot"></span>
+                  <span className="typing-dot"></span>
+                  <span className="typing-dot"></span>
+                </div>
               </div>
-            </div>
-          )}
-          <div ref={messagesEndRef} />
-        </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
 
-        {/* Composer */}
-        <div className="chat-composer">
-          <form onSubmit={handleSendMessage} className="composer-form">
-            <input
-              type="text"
-              className="composer-input"
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              placeholder="Type a message to Shakti in Hinglish..."
-              autoFocus
-            />
-            <button
-              type="submit"
-              className="btn-send"
-              disabled={!inputText.trim() || isTyping}
-              title="Send message"
-            >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="22" y1="2" x2="11" y2="13"></line>
-                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-              </svg>
-            </button>
-          </form>
+          {/* Composer */}
+          <div className="chat-composer">
+            <form onSubmit={handleSendMessage} className="composer-form">
+              <input
+                type="text"
+                className="composer-input"
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                placeholder="Type a message to Shakti in Hinglish..."
+                autoFocus
+              />
+              <button
+                type="submit"
+                className="btn-send"
+                disabled={!inputText.trim() || isTyping}
+                title="Send message"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="22" y1="2" x2="11" y2="13"></line>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+              </button>
+            </form>
+          </div>
         </div>
       </div>
-    </div>
 
       {/* On-Screen Modal for Need Attention */}
       {showAttentionModal && (

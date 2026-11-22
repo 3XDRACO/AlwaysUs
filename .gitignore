@@ -59,3 +59,6 @@ Desktop.ini
 # Misc
 *.pem
 storage/
+
+# Local sync cache
+.chat_data/
